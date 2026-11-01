@@ -1,0 +1,150 @@
+# Builds the vovoscan desktop installers from the private app repository and publishes them here, publicly.
+# Public repository = free hosted runners (macOS included) and public download links. The app's source is checked out
+# on the runner only: nothing but the installers and their SHA-256 leaves it.
+#
+# Secret MOB_READ_TOKEN: a fine-grained token with Contents: read on djabiridrissou/vovoscan-mob, nothing else.
+# Runs by hand (Actions > Desktop > Run workflow) and every 6 hours, building only when the app's desktop-release
+# branch moved since the last release. Each release carries version-free copies too, so
+# https://github.com/djabiridrissou/vovoscan-releases/releases/latest/download/vovoscan-<system>.<format>
+# is always the newest installer (the website links there).
+name: Desktop
+
+on:
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Build even if desktop-release has not moved
+        type: boolean
+        default: false
+  schedule:
+    - cron: "17 */6 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: desktop
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  APP_REPO: djabiridrissou/vovoscan-mob
+  APP_BRANCH: desktop-release
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      build: ${{ steps.plan.outputs.build }}
+      sha: ${{ steps.plan.outputs.sha }}
+      version: ${{ steps.plan.outputs.version }}
+    steps:
+      - id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          APP_TOKEN: ${{ secrets.MOB_READ_TOKEN }}
+          FORCE: ${{ inputs.force || false }}
+        run: |
+          sha=$(GH_TOKEN="$APP_TOKEN" gh api "repos/$APP_REPO/commits/$APP_BRANCH" --jq .sha)
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { echo "Could not read $APP_REPO@$APP_BRANCH"; exit 1; }
+          last=$(gh api --paginate "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/desktop-v" --jq '.[].ref' \
+            | sed -n 's|^refs/tags/desktop-v\([0-9]*\.[0-9]*\.[0-9]*\)$|\1|p' | sort -V | tail -n 1)
+          built=""
+          if [[ -n "$last" ]]; then
+            built=$(gh release view "desktop-v$last" --repo "$GITHUB_REPOSITORY" --json body --jq .body \
+              | sed -n 's|^Source: \([0-9a-f]\{40\}\)$|\1|p')
+          fi
+          if [[ "$built" == "$sha" && "$FORCE" != "true" ]]; then
+            echo "desktop-release $sha already released as $last"
+            echo "build=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [[ -z "$last" ]]; then version="1.0.0"; else
+            IFS=. read -r major minor patch <<< "$last"; version="$major.$minor.$((patch + 1))"; fi
+          echo "Building $sha as $version (last: ${last:-none})"
+          { echo "build=true"; echo "sha=$sha"; echo "version=$version"; } >> "$GITHUB_OUTPUT"
+
+  build:
+    name: ${{ matrix.name }}
+    needs: plan
+    if: needs.plan.outputs.build == 'true'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - { name: macos-arm64, os: macos-15, task: packageDmg, format: dmg, gradlew: ./gradlew }
+          - { name: macos-x64, os: macos-15-intel, task: packageDmg, format: dmg, gradlew: ./gradlew }
+          - { name: windows-x64, os: windows-latest, task: packageMsi, format: msi, gradlew: ./gradlew.bat }
+          - { name: linux-x64, os: ubuntu-latest, task: packageDeb, format: deb, gradlew: ./gradlew }
+    env:
+      VERSION: ${{ needs.plan.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.APP_REPO }}
+          ref: ${{ needs.plan.outputs.sha }}
+          token: ${{ secrets.MOB_READ_TOKEN }}
+          persist-credentials: false
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      # No Gradle cache: a public repository's caches must never hold the private build.
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-disabled: true
+
+      - name: Linux packaging tools
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y fakeroot
+
+      - name: Build
+        run: ${{ matrix.gradlew }} :desktopApp:${{ matrix.task }} "-Pvovoscan.versionName=$VERSION" --no-daemon
+
+      - name: Name the installer
+        run: |
+          mkdir dist
+          files=(desktopApp/build/compose/binaries/main/${{ matrix.format }}/*.${{ matrix.format }})
+          [[ ${#files[@]} -eq 1 && -f "${files[0]}" ]] || { echo "Expected one installer, found: ${files[*]}"; exit 1; }
+          cp "${files[0]}" "dist/vovoscan-$VERSION-${{ matrix.name }}.${{ matrix.format }}"
+          cp "${files[0]}" "dist/vovoscan-${{ matrix.name }}.${{ matrix.format }}"
+          ls -l dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vovoscan-${{ matrix.name }}
+          path: dist/*
+          retention-days: 1
+          if-no-files-found: error
+
+  release:
+    needs: [plan, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.plan.outputs.version }}
+          SHA: ${{ needs.plan.outputs.sha }}
+        run: |
+          (cd dist && sha256sum -- * > SHA256SUMS.txt && cat SHA256SUMS.txt)
+          notes=$(printf '%s\n\n%s\n\nSource: %s\n' \
+            "Desktop installers: macOS Apple silicon and Intel (.dmg), Windows (.msi), Linux (.deb)." \
+            "Not signed yet: on macOS, right-click the app and choose Open the first time; on Windows, More info, then Run anyway." \
+            "$SHA")
+          gh release create "desktop-v$VERSION" dist/* --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "vovoscan desktop $VERSION" --notes "$notes" --latest
