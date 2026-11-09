@@ -7,6 +7,18 @@
 # branch moved since the last release. Each release carries version-free copies too, so
 # https://github.com/djabiridrissou/vovoscan-releases/releases/latest/download/vovoscan-<system>.<format>
 # is always the newest installer (the website links there).
+#
+# macOS: each .dmg is signed with the Developer ID certificate (the app, its runtime and every native library inside
+# its jars, hardened runtime, secure timestamp: Compose's signing), notarized by Apple (notarytool, App Store Connect
+# API key), stapled, then checked with Gatekeeper's own assessment, so it opens with no warning. Without the secrets
+# below, or if any step fails, the run fails and the previous release stays the latest: an unsigned .dmg is never
+# published again. Secrets (Settings > Secrets and variables > Actions):
+#   MACOS_CERTIFICATE_P12        base64 of the "Developer ID Application" certificate and its private key (.p12)
+#   MACOS_CERTIFICATE_PASSWORD   the .p12's password
+#   APPLE_API_KEY_P8             base64 of the App Store Connect API key (.p8)
+#   APPLE_API_KEY_ID             its key id
+#   APPLE_API_ISSUER_ID          its issuer id
+# Windows: unsigned, SmartScreen warns until a code-signing certificate is set up.
 name: Desktop
 
 on:
@@ -105,8 +117,55 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y fakeroot
 
+      # A keychain of the run's own holding the Developer ID certificate, deleted at the end of the job.
+      - name: macOS signing keychain
+        id: signing
+        if: runner.os == 'macOS'
+        env:
+          CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+          API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+        run: |
+          if [[ -z "$CERTIFICATE_P12" || -z "$CERTIFICATE_PASSWORD" || -z "$API_KEY_P8" || -z "$API_KEY_ID" \
+            || -z "$API_ISSUER_ID" ]]; then
+            echo "::error::macOS signing secrets missing: no unsigned .dmg is published."
+            exit 1
+          fi
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          keychain_password=$(openssl rand -hex 24)
+          umask 077
+          printf '%s' "$CERTIFICATE_P12" | base64 --decode > "$RUNNER_TEMP/certificate.p12"
+          printf '%s' "$API_KEY_P8" | base64 --decode > "$RUNNER_TEMP/notary-key.p8"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          security import "$RUNNER_TEMP/certificate.p12" -k "$keychain" -P "$CERTIFICATE_PASSWORD" -f pkcs12 \
+            -T /usr/bin/codesign -T /usr/bin/security
+          rm -f "$RUNNER_TEMP/certificate.p12"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$keychain_password" "$keychain" > /dev/null
+          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+          full=$(security find-identity -v -p codesigning "$keychain" \
+            | sed -n 's/.*"\(Developer ID Application: .*\)"$/\1/p' | head -n 1)
+          [[ -n "$full" ]] || { echo "::error::No Developer ID Application identity in MACOS_CERTIFICATE_P12."; exit 1; }
+          {
+            echo "keychain=$keychain"
+            echo "identity=${full#Developer ID Application: }"
+            echo "full_identity=$full"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Build
-        run: ${{ matrix.gradlew }} :desktopApp:${{ matrix.task }} "-Pvovoscan.versionName=$VERSION" --no-daemon
+        env:
+          KEYCHAIN: ${{ steps.signing.outputs.keychain }}
+          IDENTITY: ${{ steps.signing.outputs.identity }}
+        run: |
+          signing=()
+          if [[ "$RUNNER_OS" == "macOS" ]]; then
+            signing=(-Pcompose.desktop.mac.sign=true "-Pcompose.desktop.mac.signing.identity=$IDENTITY" \
+              "-Pcompose.desktop.mac.signing.keychain=$KEYCHAIN")
+          fi
+          ${{ matrix.gradlew }} :desktopApp:${{ matrix.task }} "-Pvovoscan.versionName=$VERSION" "${signing[@]}" --no-daemon
 
       - name: Name the installer
         run: |
@@ -114,8 +173,52 @@ jobs:
           files=(desktopApp/build/compose/binaries/main/${{ matrix.format }}/*.${{ matrix.format }})
           [[ ${#files[@]} -eq 1 && -f "${files[0]}" ]] || { echo "Expected one installer, found: ${files[*]}"; exit 1; }
           cp "${files[0]}" "dist/vovoscan-$VERSION-${{ matrix.name }}.${{ matrix.format }}"
-          cp "${files[0]}" "dist/vovoscan-${{ matrix.name }}.${{ matrix.format }}"
+
+      # The image signed too, then Apple's notarization (minutes, waited for), its ticket stapled, and the result
+      # checked as Gatekeeper sees a download: the image, then the app inside it.
+      - name: Notarize and staple
+        if: runner.os == 'macOS'
+        env:
+          KEYCHAIN: ${{ steps.signing.outputs.keychain }}
+          FULL_IDENTITY: ${{ steps.signing.outputs.full_identity }}
+          API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+        run: |
+          dmg="dist/vovoscan-$VERSION-${{ matrix.name }}.dmg"
+          codesign --force --timestamp --keychain "$KEYCHAIN" --sign "$FULL_IDENTITY" "$dmg"
+          xcrun notarytool submit "$dmg" --key "$RUNNER_TEMP/notary-key.p8" --key-id "$API_KEY_ID" \
+            --issuer "$API_ISSUER_ID" --wait --timeout 45m --output-format json > "$RUNNER_TEMP/notary.json" || true
+          cat "$RUNNER_TEMP/notary.json"
+          id=$(plutil -extract id raw -o - "$RUNNER_TEMP/notary.json" 2>/dev/null || true)
+          status=$(plutil -extract status raw -o - "$RUNNER_TEMP/notary.json" 2>/dev/null || true)
+          if [[ "$status" != "Accepted" ]]; then
+            [[ -n "$id" ]] && xcrun notarytool log "$id" --key "$RUNNER_TEMP/notary-key.p8" --key-id "$API_KEY_ID" \
+              --issuer "$API_ISSUER_ID" || true
+            echo "::error::Notarization ended with status '${status:-unknown}'."
+            exit 1
+          fi
+          xcrun stapler staple "$dmg"
+          xcrun stapler validate "$dmg"
+          spctl --assess --type open --context context:primary-signature --verbose=2 "$dmg"
+          mount=$(mktemp -d)
+          hdiutil attach "$dmg" -nobrowse -readonly -mountpoint "$mount" > /dev/null
+          trap 'hdiutil detach "$mount" -quiet || true' EXIT
+          codesign --verify --deep --strict --verbose=2 "$mount/vovoscan.app"
+          spctl --assess --type execute --verbose=2 "$mount/vovoscan.app"
+
+      # The version-free copy (the website's link) is made from the final, stapled file.
+      - name: Version-free copy
+        run: |
+          cp "dist/vovoscan-$VERSION-${{ matrix.name }}.${{ matrix.format }}" "dist/vovoscan-${{ matrix.name }}.${{ matrix.format }}"
           ls -l dist
+
+      - name: Remove the signing keychain
+        if: always() && runner.os == 'macOS'
+        env:
+          KEYCHAIN: ${{ steps.signing.outputs.keychain }}
+        run: |
+          [[ -n "$KEYCHAIN" ]] && security delete-keychain "$KEYCHAIN" || true
+          rm -f "$RUNNER_TEMP/notary-key.p8" "$RUNNER_TEMP/notary.json"
 
       - uses: actions/upload-artifact@v4
         with:
@@ -144,7 +247,7 @@ jobs:
           (cd dist && sha256sum -- * > SHA256SUMS.txt && cat SHA256SUMS.txt)
           notes=$(printf '%s\n\n%s\n\nSource: %s\n' \
             "Desktop installers: macOS Apple silicon and Intel (.dmg), Windows (.msi), Linux (.deb)." \
-            "Not signed yet: on macOS, right-click the app and choose Open the first time; on Windows, More info, then Run anyway." \
+            "macOS: signed and notarized by Apple. Windows: not signed yet, click More info, then Run anyway." \
             "$SHA")
           gh release create "desktop-v$VERSION" dist/* --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
             --title "vovoscan desktop $VERSION" --notes "$notes" --latest
