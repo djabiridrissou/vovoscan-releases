@@ -11,8 +11,8 @@
 # macOS: each .dmg is signed with the Developer ID certificate (the app, its runtime and every native library inside
 # its jars, hardened runtime, secure timestamp: Compose's signing), notarized by Apple (notarytool, App Store Connect
 # API key), stapled, then checked with Gatekeeper's own assessment, so it opens with no warning. Without the secrets
-# below, or if any step fails, the run fails and the previous release stays the latest: an unsigned .dmg is never
-# published again. Secrets (Settings > Secrets and variables > Actions):
+# below the .dmg is built unsigned (a warning on the run, macOS asks for Privacy & Security > Open Anyway); with them,
+# any failed signing step fails the run. Secrets (Settings > Secrets and variables > Actions):
 #   MACOS_CERTIFICATE_P12        base64 of the "Developer ID Application" certificate and its private key (.p12)
 #   MACOS_CERTIFICATE_PASSWORD   the .p12's password
 #   APPLE_API_KEY_P8             base64 of the App Store Connect API key (.p8)
@@ -28,6 +28,10 @@ on:
         description: Build even if desktop-release has not moved
         type: boolean
         default: false
+      ref:
+        description: Branch of the app repository to build
+        type: string
+        default: desktop-release
   schedule:
     - cron: "17 */6 * * *"
 
@@ -44,7 +48,7 @@ defaults:
 
 env:
   APP_REPO: djabiridrissou/vovoscan-mob
-  APP_BRANCH: desktop-release
+  APP_BRANCH: ${{ inputs.ref || 'desktop-release' }}
 
 jobs:
   plan:
@@ -130,8 +134,9 @@ jobs:
         run: |
           if [[ -z "$CERTIFICATE_P12" || -z "$CERTIFICATE_PASSWORD" || -z "$API_KEY_P8" || -z "$API_KEY_ID" \
             || -z "$API_ISSUER_ID" ]]; then
-            echo "::error::macOS signing secrets missing: no unsigned .dmg is published."
-            exit 1
+            echo "::warning::macOS signing secrets missing: this .dmg is unsigned."
+            echo "sign=false" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
           keychain="$RUNNER_TEMP/signing.keychain-db"
           keychain_password=$(openssl rand -hex 24)
@@ -150,6 +155,7 @@ jobs:
             | sed -n 's/.*"\(Developer ID Application: .*\)"$/\1/p' | head -n 1)
           [[ -n "$full" ]] || { echo "::error::No Developer ID Application identity in MACOS_CERTIFICATE_P12."; exit 1; }
           {
+            echo "sign=true"
             echo "keychain=$keychain"
             echo "identity=${full#Developer ID Application: }"
             echo "full_identity=$full"
@@ -157,11 +163,12 @@ jobs:
 
       - name: Build
         env:
+          SIGN: ${{ steps.signing.outputs.sign }}
           KEYCHAIN: ${{ steps.signing.outputs.keychain }}
           IDENTITY: ${{ steps.signing.outputs.identity }}
         run: |
           signing=()
-          if [[ "$RUNNER_OS" == "macOS" ]]; then
+          if [[ "$SIGN" == "true" ]]; then
             signing=(-Pcompose.desktop.mac.sign=true "-Pcompose.desktop.mac.signing.identity=$IDENTITY" \
               "-Pcompose.desktop.mac.signing.keychain=$KEYCHAIN")
           fi
@@ -177,7 +184,7 @@ jobs:
       # The image signed too, then Apple's notarization (minutes, waited for), its ticket stapled, and the result
       # checked as Gatekeeper sees a download: the image, then the app inside it.
       - name: Notarize and staple
-        if: runner.os == 'macOS'
+        if: steps.signing.outputs.sign == 'true'
         env:
           KEYCHAIN: ${{ steps.signing.outputs.keychain }}
           FULL_IDENTITY: ${{ steps.signing.outputs.full_identity }}
@@ -213,7 +220,7 @@ jobs:
           ls -l dist
 
       - name: Remove the signing keychain
-        if: always() && runner.os == 'macOS'
+        if: always() && steps.signing.outputs.sign == 'true'
         env:
           KEYCHAIN: ${{ steps.signing.outputs.keychain }}
         run: |
@@ -243,11 +250,17 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.plan.outputs.version }}
           SHA: ${{ needs.plan.outputs.sha }}
+          SIGNED: ${{ secrets.APPLE_API_KEY_ID != '' && secrets.MACOS_CERTIFICATE_P12 != '' }}
         run: |
+          if [[ "$SIGNED" == "true" ]]; then
+            mac="macOS: signed and notarized by Apple."
+          else
+            mac="macOS: not signed yet, open it once from System Settings > Privacy & Security > Open Anyway."
+          fi
           (cd dist && sha256sum -- * > SHA256SUMS.txt && cat SHA256SUMS.txt)
           notes=$(printf '%s\n\n%s\n\nSource: %s\n' \
             "Desktop installers: macOS Apple silicon and Intel (.dmg), Windows (.msi), Linux (.deb)." \
-            "macOS: signed and notarized by Apple. Windows: not signed yet, click More info, then Run anyway." \
+            "$mac Windows: not signed yet, click More info, then Run anyway." \
             "$SHA")
           gh release create "desktop-v$VERSION" dist/* --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
             --title "vovoscan desktop $VERSION" --notes "$notes" --latest
